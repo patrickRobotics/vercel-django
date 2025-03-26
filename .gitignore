@@ -11,3 +11,4 @@ __pycache__/
 # Ignore the Django static and media directories (if applicable)
 staticfiles/
 media/
+.idea/
