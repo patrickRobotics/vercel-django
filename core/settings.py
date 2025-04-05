@@ -43,7 +43,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     #apps
-    'app'
+    'ussd.apps.UssdConfig',
 ]
 
 MIDDLEWARE = [
@@ -139,3 +139,9 @@ STATICFILES_DIRS = [
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+SESSION_SERIALIZER = 'django.contrib.sessions.serializers.PickleSerializer'
+
+DEFAULT_USSD_SCREEN_JOURNEY = os.path.join(BASE_DIR, 'crediation.yml')
+V2_API_BASE_URL = os.environ['V2_API_BASE_URL']
+V2_API_KEY = os.environ["V2_API_KEY"]

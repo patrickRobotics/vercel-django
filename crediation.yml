@@ -1,0 +1,498 @@
+initial_screen:
+  next_screen: borrower_lookup
+  type: initial_screen
+
+borrower_lookup:
+  type: http_screen
+  next_screen: router_screen
+  session_key: borrower_data
+  http_request:
+    method: get
+    url: "{{ V2_API_BASE_URL }}/borrowers/lookup/{{ phone_number }}/"
+    verify: true
+    timeout: 30
+    headers:
+      APIKEY: "{{ V2_API_KEY }}"
+      content-type: application/json
+
+router_screen:
+  type: router_screen
+  default_next_screen: service_unavailable
+  router_options:
+    - expression: "{{ borrower_data.loan_limit < 20000  and  borrower_data.status == 'active' }}"
+      next_screen: borrower_below_limit
+    - expression: "{{ borrower_data.status == 'active' and borrower_data.loan_limit > 19999 and borrower_data.loan_action == 'can_apply_for_loan'}}"
+      next_screen: generate_loan_offers
+    - expression: "{{ borrower_data.status == 'active' and borrower_data.loan_limit > 19999 and borrower_data.loan_action == 'application_in_progress'}}"
+      next_screen: application_in_progress
+    - expression: "{{ borrower_data.status == 'active' and borrower_data.loan_limit > 19999 and borrower_data.loan_action == 'has_an_overdue_loan'}}"
+      next_screen: get_loan_balance_start
+    - expression: "{{ borrower_data.status == 'active' and borrower_data.loan_limit > 19999 and borrower_data.loan_action == 'has_an_active_loan'}}"
+      next_screen: get_loan_balance_start
+    - expression: "{{ borrower_data.status_code == 404 }}"
+      next_screen: potential_lead
+    - expression: "{{ borrower_data.status_code == 500 }}"
+      next_screen: service_unavailable
+    - expression: "{{ borrower_data.status == 'awaiting_activation' }}"
+      next_screen: awaiting_activation
+
+generate_loan_offers:
+  type: function_screen
+  default_next_screen: calculate_global_loan_limit
+  function: utils.generate_offers
+  session_key: loan_offers
+  next_screen: calculate_global_loan_limit
+
+calculate_global_loan_limit:
+  type: function_screen
+  default_next_screen: update_borrower_session_data
+  function: utils.set_global_limit
+  session_key: global_loan_limit
+  next_screen: update_borrower_session_data
+
+update_borrower_session_data:
+  type: update_session_screen
+  next_screen: check_product_optin
+  values_to_update:
+    - expression: "{{ borrower_data.status == 'active' }}"
+      key: loan_limit
+      value: "{{ global_loan_limit }}"
+    - expression: "{{ borrower_data.status == 'active' }}"
+      key: borrower_url
+      value: "{{ borrower_data.url }}"
+    - expression: "{{ borrower_data.status == 'active' }}"
+      key: product_url
+      value: "{{ borrower_data.product }}"
+
+check_product_optin:
+  type: router_screen
+  default_next_screen: error_screen
+  router_options:
+    - expression: "{{ borrower_data.opt_in_status == true and borrower_data.status == 'active' }}"
+      next_screen: ussd_main_menu
+    - expression: "{{ borrower_data.opt_in_status == false and borrower_data.status == 'active' }}"
+      next_screen: accept_general_toc
+
+accept_general_toc:
+  type: menu_screen
+  text: "Please accept Novapay general terms and conditions. Visit www.crediation.com/tac"
+  options:
+    - text: Accept
+      next_screen: opt_in_to_product
+    - text: Decline
+      next_screen: decline_terms
+  input_identifier: toc_accept
+
+opt_in_to_product:
+  type: http_screen
+  next_screen: opt_in_response
+  session_key: product_opt_in
+  http_request:
+    method: post
+    url: "{{ V2_API_BASE_URL }}/product_opt_ins"
+    verify: true
+    timeout: 30
+    json:
+      product: "{{ product_url }}"
+      borrower: "{{ borrower_url }}"
+    headers:
+      APIKEY: "{{ V2_API_KEY }}"
+      content-type: application/json
+
+opt_in_response:
+  type: router_screen
+  default_next_screen: external_request_error
+  router_options:
+    - expression: "{{ product_opt_in.status_code == 201 }}"
+      next_screen: ussd_main_menu
+
+ussd_main_menu:
+  type: menu_screen
+  text: "Welcome to Novapay"
+  options:
+    - text: Apply for a loan
+      next_screen:
+        - condition: borrower_data.loan_action == 'can_apply_for_loan'
+          next_screen: display_loan_offers
+        - condition: borrower_data.loan_action == 'has_an_active_loan'
+          next_screen: get_loan_balance_start
+        - condition: borrower_data.loan_action == 'has_an_overdue_loan'
+          next_screen: get_loan_balance_start
+    - text: Check loan balance
+      next_screen:
+        - condition: borrower_data.loan_action == 'has_an_active_loan' or borrower_data.loan_action == 'has_an_overdue_loan'
+          next_screen: get_loan_balance_start
+        - condition: borrower_data.loan_action == 'can_apply_for_loan'
+          next_screen: has_no_loan_balance
+    - text: Check loan limit
+      next_screen: check_loan_limit
+    - text: How to repay your loan
+      next_screen: how_to_pay_loan
+
+display_loan_offers:
+  type: menu_screen
+  text: "You qualify for up to Kshs. {{ loan_limit }}. Please select loan limit and loan period."
+  items:
+    text: "{{ value['limit'] }} for {{ key }} days"
+    value: "{{ value }}"
+    with_dict: "{{ loan_offers }}"
+    session_key: selected_offer
+    next_screen: loan_apply
+
+loan_apply:
+  type: input_screen
+  text: How much are you applying for? Enter amount from Kshs 10000 to {{ selected_offer['limit'] }}
+  input_identifier: loan_amount
+  next_screen:
+    - condition: loan_amount|int >= 10000 and loan_amount|int <= selected_offer['limit']
+      next_screen: enter_distributor_till
+  validators:
+    - regex: ^[0-9]{1,6}$
+      text: Only numbers are allowed. Enter amount from Kshs 10000 to {{ selected_offer['limit'] }}
+  default_next_screen: invalid_input
+
+invalid_input:
+  type: menu_screen
+  text: "Kshs {{ loan_amount }} is not within your limit. Please enter valid loan amount between Kshs 10000 and Kshs {{ selected_offer['limit'] }}."
+  options:
+    - text: Back
+      next_screen: loan_apply
+
+enter_distributor_till:
+  type: input_screen
+  text: Enter the distributor's till number
+  input_identifier: till_no
+  next_screen: show_loan_details
+
+show_loan_details:
+  type: menu_screen
+  text: "Kindly confirm that Acc {{ phone_number }} is applying for Kshs {{ loan_amount }}
+      due in {{ selected_offer['period'] }} days at {{ selected_offer['interest'] }}%
+      to be disbursed to distributor till number {{ till_no }}"
+  options:
+    - text: Accept
+      next_screen: http_request_loan
+    - text: Decline
+      next_screen: decline_terms
+  input_identifier: accept_loan
+
+http_request_loan:
+  type: http_screen
+  next_screen: loan_application_status
+  session_key: loan_application
+  http_request:
+    method: post
+    url: "{{ V2_API_BASE_URL }}/loans"
+    json:
+      principal: "{{ loan_amount }}"
+      interest_rate: "{{ selected_offer['interest'] }}"
+      session_id: "{{ session_id }}"
+      borrower: "{{ borrower_url }}"
+      applicant: "{{ phone_number }}"
+      agreement_signed: "true"
+      date_agreement_signed: "{{ date_agreement_signed }}"
+      loan_period: "{{ selected_offer['period'] }}"
+      disbursement_account: "{{ till_no }}"
+      product: "{{ product_url }}"
+      channel: "ussd"
+    verify: true
+    timeout: 30
+    headers:
+      APIKEY: "{{ V2_API_KEY }}"
+      content-type: application/json
+
+loan_application_status:
+  type: router_screen
+  default_next_screen: external_request_error
+  router_options:
+    - expression: "{{ loan_application.status_code == 201 }}"
+      next_screen: loan_application_end
+    - expression: "{{ loan_application.status_code == 400 }}"
+      next_screen: external_request_error
+    - expression: "{{ loan_application.status_code == 500 }}"
+      next_screen: external_request_error
+
+get_loan_balance_start:
+  type: function_screen
+  default_next_screen: get_loan_balance
+  function: utils.format_date
+  session_key: date_today
+  next_screen: get_loan_balance
+
+get_loan_balance:
+  type: http_screen
+  next_screen: show_loan_balance
+  session_key: loan_balance
+  http_request:
+    method: get
+    url: "{{ V2_API_BASE_URL }}/loans/{{ borrower_data.loan.ref }}/outstanding_balance?date={{ date_today }}"
+    verify: true
+    timeout: 30
+    headers:
+      APIKEY: "{{ V2_API_KEY }}"
+      content-type: application/json
+
+show_loan_balance:
+  type: menu_screen
+  text: "You have an {{ borrower_data.loan.status }} loan with outstanding balance of Kshs
+  {{ loan_balance.total_outstanding_balance }}. For any queries kindly get in touch with us on 0704 666 222."
+  options:
+    - text: Repay
+      next_screen: repay_options
+    - text: Home
+      next_screen: ussd_main_menu
+
+repay_options:
+  type: menu_screen
+  text: "Your loan balance is Kshs {{ loan_balance.total_outstanding_balance }}."
+  options:
+    - text: Make full repayment
+      next_screen:
+        - condition: loan_balance.total_outstanding_balance > 150000
+          next_screen: transaction_limit
+        - condition: loan_balance.total_outstanding_balance < 150000
+          next_screen: repay_fully
+    - text: Make partial payment
+      next_screen: repay_partial
+
+transaction_limit:
+  type: menu_screen
+  text: "Your outstanding balance of {{ loan_balance.total_outstanding_balance }} exceeds mpesa paybill
+  limit of 150,000 per transaction. Please pay in instalments."
+  options:
+    - text: Make partial payment
+      next_screen: repay_partial
+
+repay_partial:
+  type: input_screen
+  text: "Enter the amount you want to pay upto {{ loan_balance.total_outstanding_balance }}, not exceeding 150,000 per transaction."
+  input_identifier: repayment_amount
+  next_screen:
+    - condition: repayment_amount|int >= 1 and repayment_amount|int <= 150000 and repayment_amount|int <= loan_balance.total_outstanding_balance
+      next_screen: confirm_payment
+  validators:
+    - regex: ^[0-9]{1,6}$
+      text: Only numbers are allowed. Please enter the amount you want to pay upto {{ loan_balance.total_outstanding_balance }}, not exceeding 150,000 per transaction.
+  default_next_screen: invalid_payment_input
+
+invalid_payment_input:
+  type: menu_screen
+  text: "You entered invalid amount. Repayment amount should not exceed Kes. 150,000 per transaction."
+  options:
+    - text: Back
+      next_screen: repay_partial
+
+repay_fully:
+  type: menu_screen
+  text: "Ensure you have enough money in your M-Pesa wallet to pay Kshs. {{ loan_balance.total_outstanding_balance }}."
+  options:
+    - text: Continue
+      next_screen: set_repayment_amount_session_data
+    - text: Cancel
+      next_screen: end_session
+
+set_repayment_amount_session_data:
+  type: update_session_screen
+  next_screen: confirm_payment
+  values_to_update:
+    - expression: "{{ borrower_data.status == 'active' }}"
+      key: repayment_amount
+      value: "{{ loan_balance.total_outstanding_balance }}"
+
+confirm_payment:
+  type: menu_screen
+  text: "Pay Kshs. {{ repayment_amount }} to Novapay for loan account
+  {{borrower_data.partner_defined_id}}."
+  options:
+    - text: Agree
+      next_screen: repay_loan
+    - text: Cancel
+      next_screen: end_session
+
+repay_loan:
+  type: http_screen
+  next_screen: repay_loan_status
+  session_key: loan_repayment
+  http_request:
+    method: post
+    url: "{{ V2_API_BASE_URL }}/online_payment/lipa_na_mpesa"
+    json:
+      amount: "{{ repayment_amount }}"
+      phoneNumber: "{{ phone_number }}"
+      accountNumber: "{{ borrower_data.partner_defined_id }}"
+      loanRef: "{{ borrower_data.loan.ref }}"
+    verify: true
+    timeout: 30
+    headers:
+      APIKEY: "{{ V2_API_KEY }}"
+      content-type: application/json
+
+repay_loan_status:
+  type: router_screen
+  default_next_screen: external_request_error
+  router_options:
+    - expression: "{{ loan_repayment.status_code == 200 }}"
+      next_screen: loan_repayment_end
+    - expression: "{{ loan_repayment.status_code == 400 }}"
+      next_screen: external_request_error
+    - expression: "{{ loan_repayment.status_code == 500 }}"
+      next_screen: external_request_error
+
+has_no_loan_balance:
+  type: menu_screen
+  text: "You don't have an active loan at the moment."
+  options:
+    - text: Home
+      next_screen: ussd_main_menu
+
+potential_lead:
+  type: menu_screen
+  text: Hello, it seems you are not registered with Novapay. Do you wish to create an account?
+  error_message: |
+    You have selected invalid option try again
+  options:
+    - text: Proceed
+      next_screen: get_lead_names
+    - text: Quit
+      next_screen: quit_potential_lead
+
+get_lead_names:
+  type: input_screen
+  text: "We are glad you are interested in Novapay. Kindly start by giving us your FULL name"
+  input_identifier: lead_name
+  next_screen: get_business_name
+
+get_business_name:
+  type: input_screen
+  text: "Business name"
+  input_identifier: business_name
+  next_screen: get_business_type
+
+get_business_type:
+  type: menu_screen
+  text: "Business Type"
+  error_message: |
+    You have selected invalid option try again
+  items:
+    text: "{{item}}"
+    value: "{{item}}"
+    next_screen: get_business_location
+    session_key: business_type
+    with_items:
+      - Bar
+      - Wines & Spirits
+      - Stockist
+
+get_business_location:
+  type: input_screen
+  text: "Business location"
+  input_identifier: business_location
+  next_screen: get_distributor
+
+get_distributor:
+  type: input_screen
+  text: "Which EABL distributor do you buy from?"
+  input_identifier: distributor
+  next_screen: submit_lead
+
+submit_lead:
+  type: http_screen
+  next_screen: lead_capture_end
+  session_key: lead_submission
+  http_request:
+    method: post
+    url: "{{ V2_API_BASE_URL }}/leads"
+    verify: true
+    timeout: 30
+    json:
+      name: "{{ lead_name }}"
+      phone: "{{ phone_number }}"
+      business_name: "{{ business_name }}"
+      business_location: "{{ business_location }}"
+      distributor: "{{ distributor }}"
+      registration_type: "{{ business_type }}"
+    headers:
+      APIKEY: "{{ V2_API_KEY }}"
+      content-type: application/json
+
+lead_capture_end:
+  type: router_screen
+  default_next_screen: external_request_error
+  router_options:
+    - expression: "{{ lead_submission.status_code == 201 }}"
+      next_screen: lead_capture_success
+    - expression: "{{ lead_submission.status_code == 500 }}"
+      next_screen: external_request_error
+    - expression: "{{ lead_submission.status_code == 400 }}"
+      next_screen: external_request_error
+
+lead_capture_success:
+  type: quit_screen
+  text: "Hi {{ lead_name }}, we have received your request to join Novapay. Our business team will be in touch soon to complete
+  your onboarding process. For more info visit www.crediation.com"
+
+quit_potential_lead:
+  type: quit_screen
+  text: "Novapay is a stock financing facility for bars, stockists and wines & spirits buying goods from EABL.
+        For more info, visit www.crediation.com."
+
+loan_repayment_end:
+  type: quit_screen
+  text: "Repayment of Kshs. {{ repayment_amount }} for account {{ borrower_data.partner_defined_id }}
+  is being processed. Quit the session to complete M-Pesa transaction."
+
+loan_application_end:
+  type: quit_screen
+  text: "Your loan of Kshs. {{ loan_amount }} for {{loan_application.loan_period}} days at
+      {{loan_application.interest_rate}}%, to be disbursed to distributor Till {{ till_no }}
+      has been received and is being processed. You will receive the approval confirmation shortly."
+
+error_screen:
+  type: quit_screen
+  text: "We are experiencing a technical error. Contact Crediation on 0704 666 222 for assistance."
+
+external_request_error:
+  type: quit_screen
+  text: "Request not successful due to a technical error. Contact Crediation on 0704 666 222 for assistance."
+
+decline_terms:
+  type: quit_screen
+  text: "Thank you for accessing Novapay. When ready to apply again, please dial the code again."
+
+borrower_below_limit:
+  type: quit_screen
+  text: "Thank you for expressing interest in Novapay. You currently don't have a loan limit.
+      The more stock you purchase from your distributor the higher the chances of getting a loan limit!
+      For more information, please contact Crediation on 0704 666 222."
+
+application_in_progress:
+  type: quit_screen
+  text: "Your Novapay loan application of {{borrower_data.loan['principal']}} is being processed.
+      You will receive an SMS once your application has been approved.
+      For queries contact Novapay on 0704 666 222."
+
+service_unavailable:
+  type: quit_screen
+  text: "This service is temporarily unavailable. Please try again later.
+        For queries contact Crediation on 0704 666 222."
+
+awaiting_activation:
+  type: quit_screen
+  text: "We have not completed setting up your account. Please try again later.
+        For queries contact Crediation on 0704 666 222."
+
+check_loan_limit:
+  type: quit_screen
+  text: "Your loan limit is {{ borrower_data.loan_limit if borrower_data.has_max_loan_duration else borrower_data.loan_limit / 2 }}.\n
+        For queries contact Crediation on 0704 666 222."
+
+how_to_pay_loan:
+  type: quit_screen
+  text: "To repay your loan: \n
+        Use Lipa na M-Pesa Pay Bill, business number is 537131, Account Number is {{ borrower_data.partner_defined_id }}.
+        Enter the amount you wish to pay and send. \n
+        For queries contact Crediation on 0704 666 222."
+
+end_session:
+  type: quit_screen
+  text: Thank you for accessing Novapay.
