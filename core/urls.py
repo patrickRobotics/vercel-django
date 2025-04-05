@@ -16,10 +16,13 @@ Including another URLconf
 """
 import os
 from dotenv import load_dotenv
+from django.conf.urls import url
 from django.contrib import admin
 from django.urls import include, path
+from ussd.views import AfricasTalkingUssdGateway
 
 load_dotenv()
+
 
 adminPath = os.getenv('ADMIN_PATH')
 if(adminPath == None):
@@ -33,4 +36,7 @@ admin.site.site_title = 'Sandeep Shaw'
 urlpatterns = [
     path('', include("app.urls")),
     path(f'{adminPath}/', admin.site.urls),
+    url(r'^ussd',
+        AfricasTalkingUssdGateway.as_view(),
+        name='ussd_url')
 ]
